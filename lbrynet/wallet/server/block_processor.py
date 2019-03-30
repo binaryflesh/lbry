@@ -1,5 +1,4 @@
 import struct
-
 import msgpack
 
 from lbrynet.wallet.transaction import Transaction, Output
@@ -36,27 +35,36 @@ class LBRYBlockProcessor(BlockProcessor):
         undo_info = []
         add_undo = undo_info.append
         update_inputs = set()
-        for etx, txid in txs:
+        sqldb = self.db.sqldb
+        for position, (etx, txid) in enumerate(txs):
             update_inputs.clear()
-            tx = Transaction(etx.serialize())
+            tx = Transaction(etx.serialize(), height=height, position=position)
             for index, output in enumerate(tx.outputs):
-                if not output.is_claim:
-                    continue
-                if output.script.is_claim_name:
+                if output.is_support:
+                    sqldb.insert_support(output)
+                elif output.script.is_claim_name:
                     add_undo(self.advance_claim_name_transaction(output, height, txid, index))
+                    sqldb.insert_claim(output)
                 elif output.script.is_update_claim:
                     update_input = self.db.get_update_input(output.claim_hash, tx.inputs)
                     if update_input:
                         update_inputs.add(update_input)
                         add_undo(self.advance_update_claim(output, height, txid, index))
+                        sqldb.update_claim(output)
                     else:
                         info = (hash_to_hex_str(txid), output.claim_id,)
                         self.logger.error("REJECTED: {} updating {}".format(*info))
+            possible_supports = []
             for txin in tx.inputs:
                 if txin not in update_inputs:
                     abandoned_claim_id = self.db.abandon_spent(txin.txo_ref.tx_ref.hash, txin.txo_ref.position)
                     if abandoned_claim_id:
                         add_undo((abandoned_claim_id, self.db.get_claim_info(abandoned_claim_id)))
+                        sqldb.delete_claim(abandoned_claim_id)
+                    else:
+                        possible_supports.append(txin)
+            sqldb.maybe_delete_supports(possible_supports)
+        sqldb.update_claimtrie(height)
         return undo_info
 
     def advance_update_claim(self, output: Output, height, txid, nout):

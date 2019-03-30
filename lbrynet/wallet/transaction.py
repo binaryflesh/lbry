@@ -51,6 +51,10 @@ class Output(BaseOutput):
         return self.script.is_claim_name or self.script.is_update_claim
 
     @property
+    def is_support(self) -> bool:
+        return self.script.is_support_claim
+
+    @property
     def claim_hash(self) -> bytes:
         if self.script.is_claim_name:
             return hash160(self.tx_ref.hash + struct.pack('>I', self.position))

@@ -1,17 +1,290 @@
 import msgpack
 import struct
-
+import sqlite3
 import time
-from torba.server.hash import hash_to_hex_str
+from binascii import hexlify
+from typing import Union, Tuple, List
 
 from torba.server.db import DB
+from torba.server.hash import hash_to_hex_str
+from torba.client.basedatabase import query
 
+from lbrynet.wallet.transaction import Transaction
 from lbrynet.wallet.server.model import ClaimInfo
+
+
+class SQLDB:
+
+    TRENDING_BLOCKS = 300  # number of blocks over which to calculate trending
+
+    PRAGMAS = """
+        pragma journal_mode=WAL;
+    """
+
+    CREATE_CLAIM_TABLE = """
+        create table if not exists claim (
+            txid bytes not null,
+            nout integer not null,
+            block integer not null,
+            amount integer not null,
+            effective_amount integer not null default 0,
+            trending_amount integer not null default 0,
+            claim_id bytes not null,
+            claim_name text not null,
+            channel_id bytes
+        );
+        create index if not exists claim_claim_id_idx on claim (claim_id);
+        create index if not exists claim_claim_name_idx on claim (claim_name);
+        create index if not exists claim_channel_id_idx on claim (channel_id);
+    """
+
+    CREATE_SUPPORT_TABLE = """
+        create table if not exists support (
+            txid bytes not null,
+            nout integer not null,
+            block integer not null,
+            amount integer not null,
+            claim_id bytes not null
+        );
+        create index if not exists support_claim_id_idx on support (claim_id);
+    """
+
+    CREATE_CLAIMTRIE_TABLE = """
+        create table if not exists claimtrie (
+            claim_name text not null,
+            claim_id bytes not null,
+            block integer not null
+        );
+        create index if not exists claimtrie_claim_id_idx on claimtrie (claim_id);
+        create index if not exists claimtrie_claim_name_idx on claimtrie (claim_name);
+    """
+
+    CREATE_TAG_TABLE = """
+        create table if not exists tag (
+            tag text,
+            claim_id bytes,
+            block integer
+        );
+        create index if not exists tag_tag_idx on tag (tag);
+        create index if not exists tag_claim_id_idx on tag (claim_id);
+    """
+
+    CREATE_LOCATION_TABLE = """
+        create table if not exists location (
+            country integer,
+            state text,
+            claim_id bytes,
+            block integer
+        );
+        create index if not exists location_country_idx on location (country);
+        create index if not exists location_state_idx on location (state);
+        create index if not exists location_claim_id_idx on location (claim_id);
+    """
+
+    CREATE_LANGUAGE_TABLE = """
+        create table if not exists lang (
+            lang integer,
+            claim_id bytes,
+            block integer
+        );
+        create index if not exists lang_lang_idx on lang (lang);
+        create index if not exists lang_claim_id_idx on lang (claim_id);
+    """
+
+    CREATE_TABLES_QUERY = (
+        PRAGMAS +
+        CREATE_CLAIM_TABLE +
+        CREATE_SUPPORT_TABLE +
+        CREATE_CLAIMTRIE_TABLE +
+        CREATE_TAG_TABLE +
+        CREATE_LOCATION_TABLE +
+        CREATE_LANGUAGE_TABLE
+    )
+
+    def __init__(self, path):
+        self._db_path = path
+        self.db = None
+
+    def open(self):
+        self.db = sqlite3.connect(self._db_path, check_same_thread=False)
+        self.db.executescript(self.CREATE_TABLES_QUERY)
+
+    def close(self):
+        self.db.close()
+
+    @staticmethod
+    def _insert_sql(table: str, data: dict, ignore_duplicate: bool = False) -> Tuple[str, List]:
+        columns, values = [], []
+        for column, value in data.items():
+            columns.append(column)
+            values.append(value)
+        or_ignore = ""
+        if ignore_duplicate:
+            or_ignore = " OR IGNORE"
+        sql = "INSERT{} INTO {} ({}) VALUES ({})".format(
+            or_ignore, table, ', '.join(columns), ', '.join(['?'] * len(values))
+        )
+        return sql, values
+
+    @staticmethod
+    def _update_sql(table: str, data: dict, where: str,
+                    constraints: Union[list, tuple]) -> Tuple[str, list]:
+        columns, values = [], []
+        for column, value in data.items():
+            columns.append("{} = ?".format(column))
+            values.append(value)
+        values.extend(constraints)
+        sql = "UPDATE {} SET {} WHERE {}".format(
+            table, ', '.join(columns), where
+        )
+        return sql, values
+
+    @staticmethod
+    def claim_to_row(txo, channel_hash):
+        tx = txo.tx_ref.tx
+        return {
+            'txid': sqlite3.Binary(tx.hash),
+            'nout': txo.position,
+            'block': tx.height,
+            'amount': txo.amount,
+            'claim_id': sqlite3.Binary(txo.claim_hash),
+            'claim_name': txo.claim_name,
+            'channel_id': sqlite3.Binary(channel_hash) if channel_hash is not None else None
+        }
+
+    def insert_claim(self, txo):
+        height = txo.tx_ref.tx.height
+        self.db.execute(*self._insert_sql(
+            "claim", self.claim_to_row(txo, None)
+        ))
+        claim_hash = sqlite3.Binary(txo.claim_hash)
+        if txo.claim.is_channel:
+            claim = txo.claim.channel
+        else:
+            claim = txo.claim.stream
+        for tag in claim.tags:
+            self.db.execute(*self._insert_sql(
+                "tag", {
+                    'tag': tag,
+                    'claim_id': claim_hash,
+                    'block': height
+                }
+            ))
+        for location in claim.locations:
+            self.db.execute(*self._insert_sql(
+                "location", {
+                    'country': location.message.country,
+                    'state': location.message.state,
+                    'claim_id': claim_hash,
+                    'block': height
+                }
+            ))
+        for lang in claim.languages:
+            self.db.execute(*self._insert_sql(
+                "lang", {
+                    'lang': lang.message.language,
+                    'claim_id': claim_hash,
+                    'block': height
+                }
+            ))
+
+    def update_claim(self, txo):
+        self.delete_claim(txo.claim_hash, permanent=False)
+        self.insert_claim(txo)
+
+    def delete_claim(self, claim_hash, permanent=True):
+        claim_hash = sqlite3.Binary(claim_hash)
+        tables = ['claim', 'tag', 'lang', 'location']
+        if permanent:
+            self.db.execute(f"UPDATE claimtrie SET claim_id = NULL WHERE claim_id = ?", (claim_hash,))
+            tables.append('support')
+        for table in tables:
+            self.db.execute(f"DELETE FROM {table} WHERE claim_id = ?", (claim_hash,))
+
+    def insert_support(self, txo):
+        tx = txo.tx_ref.tx
+        self.db.execute(*self._insert_sql(
+            "support", {
+                'txid': sqlite3.Binary(tx.hash),
+                'nout': txo.position,
+                'block': tx.height,
+                'amount': txo.amount,
+                'claim_id': sqlite3.Binary(txo.claim_hash)
+            }
+        ))
+
+    def maybe_delete_supports(self, txis):
+        for txi in txis:
+            txid, nout = sqlite3.Binary(txi.txo_ref.tx_ref.hash), txi.txo_ref.position
+            self.db.execute(f"DELETE FROM support WHERE txid = ? AND nout = ?", (txid, nout))
+
+    def update_claimtrie(self, height):
+        cur = self.db.cursor()
+        cur.execute(f"""
+            UPDATE claim SET
+              effective_amount = COALESCE(
+                (SELECT SUM(amount) FROM support WHERE support.claim_id=claim.claim_id), 0
+              ) + claim.amount,
+              trending_amount = COALESCE(
+                (SELECT SUM(amount) FROM support WHERE
+                   support.claim_id=claim.claim_id AND support.block > {height-self.TRENDING_BLOCKS}), 0
+              )
+        """)
+        cur.execute("""
+            SELECT DISTINCT claim.claim_name, trie.claim_id
+            FROM claim LEFT JOIN claimtrie AS trie USING (claim_name)
+        """)
+        for claim_name, winning_id in cur.fetchall():
+            cur.execute("""
+                SELECT claim_id FROM claim
+                WHERE claim_name = ?
+                ORDER BY effective_amount DESC
+                LIMIT 1
+            """, (claim_name,))
+            new_winner = cur.fetchall()
+            if winning_id is None and new_winner:
+                self.db.execute(*self._insert_sql(
+                    "claimtrie", {
+                        'claim_name': claim_name,
+                        'claim_id': sqlite3.Binary(new_winner[0][0]),
+                        'block': height
+                    }
+                ))
+            elif new_winner and new_winner[0][0] != winning_id:
+                self.db.execute(*self._update_sql(
+                    "claimtrie", {
+                        'claim_id': sqlite3.Binary(new_winner[0][0]),
+                        'block': height
+                    }, 'claim_name = ?', (claim_name,)
+                ))
+
+    def select_claims(self, cols, **constraints):
+        cur = self.db.cursor()
+        cur.execute(*query(
+            "SELECT {} FROM claim LEFT JOIN claimtrie USING (claim_id)".format(cols), **constraints
+        ))
+        return cur.fetchall()
+
+    def get_claims(self, **constraints):
+        if 'order_by' not in constraints:
+            constraints['order_by'] = ["claim.block DESC"]
+        return [{
+            'claim_name': r[0],
+            'claim_id': hexlify(r[1][::-1]).decode(),
+            'txid': hexlify(r[2][::-1]).decode(),
+            'nout': r[3], 'amount': r[4], 'effective_amount': r[5], 'trending_amount': r[6],
+            'is_winning': bool(r[7])
+            } for r in self.select_claims(
+            "claim.claim_name, claim.claim_id, txid, nout, "
+            "amount, effective_amount, trending_amount, "
+            "claimtrie.claim_id as winner", **constraints
+        )]
 
 
 class LBRYDB(DB):
 
     def __init__(self, *args, **kwargs):
+        self.sqldb = SQLDB(':memory:')
         self.claim_cache = {}
         self.claims_signed_by_cert_cache = {}
         self.outpoint_to_claim_id_cache = {}
@@ -27,9 +300,11 @@ class LBRYDB(DB):
         self.outpoint_to_claim_id_db.close()
         self.claim_undo_db.close()
         self.utxo_db.close()
+        self.sqldb.close()
         super().close()
 
     async def _open_dbs(self, for_sync, compacting):
+        self.sqldb.open()
         await super()._open_dbs(for_sync=for_sync, compacting=compacting)
         def log_reason(message, is_for_sync):
             reason = 'sync' if is_for_sync else 'serving'

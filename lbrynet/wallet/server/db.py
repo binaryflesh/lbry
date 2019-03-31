@@ -9,7 +9,6 @@ from torba.server.db import DB
 from torba.server.hash import hash_to_hex_str
 from torba.client.basedatabase import query
 
-from lbrynet.wallet.transaction import Transaction
 from lbrynet.wallet.server.model import ClaimInfo
 
 

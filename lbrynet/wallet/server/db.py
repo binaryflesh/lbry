@@ -267,6 +267,12 @@ class SQLDB:
     def get_claims(self, **constraints):
         if 'order_by' not in constraints:
             constraints['order_by'] = ["claim.block DESC"]
+        if 'is_winning' in constraints:
+            if constraints['is_winning']:
+                constraints['claimtrie.claim_id__is_not_null'] = ''
+            else:
+                constraints['claimtrie.claim_id__is_null'] = ''
+            del constraints['is_winning']
         return [{
             'claim_name': r[0],
             'claim_id': hexlify(r[1][::-1]).decode(),
@@ -276,7 +282,7 @@ class SQLDB:
             } for r in self.select_claims(
             "claim.claim_name, claim.claim_id, txid, nout, "
             "amount, effective_amount, trending_amount, "
-            "claimtrie.claim_id as winner", **constraints
+            "claimtrie.claim_id", **constraints
         )]
 
 

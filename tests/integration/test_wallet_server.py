@@ -13,5 +13,5 @@ class TestWalletServer(CommandTestCase):
         claim2_id = unhexlify(tx2['outputs'][0]['claim_id'])[::-1]
         tx3 = await self.channel_create('@foo', allow_duplicate_name=True)
         claim3_id = unhexlify(tx3['outputs'][0]['claim_id'])[::-1]
-        txos = spv.db.sqldb.get_claims()
+        claims = spv.db.sqldb.get_claims()
         print('hi')

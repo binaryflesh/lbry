@@ -240,19 +240,19 @@ class SQLDB:
                 ORDER BY effective_amount DESC
                 LIMIT 1
             """, (claim_name,))
-            new_winner = cur.fetchall()
-            if winning_id is None and new_winner:
+            new_winner = cur.fetchone()
+            if winning_id is None:
                 self.db.execute(*self._insert_sql(
                     "claimtrie", {
                         'claim_name': claim_name,
-                        'claim_id': sqlite3.Binary(new_winner[0][0]),
+                        'claim_id': sqlite3.Binary(new_winner[0]),
                         'block': height
                     }
                 ))
-            elif new_winner and new_winner[0][0] != winning_id:
+            elif new_winner[0] != winning_id:
                 self.db.execute(*self._update_sql(
                     "claimtrie", {
-                        'claim_id': sqlite3.Binary(new_winner[0][0]),
+                        'claim_id': sqlite3.Binary(new_winner[0]),
                         'block': height
                     }, 'claim_name = ?', (claim_name,)
                 ))

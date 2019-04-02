@@ -26,8 +26,12 @@ class LBRYBlockProcessor(BlockProcessor):
         super().advance_blocks(blocks)
         pending_undo = []
         for index, block in enumerate(blocks):
-            undo = self.advance_claim_txs(block.transactions, height + index)
-            pending_undo.append((height+index, undo,))
+            try:
+                undo = self.advance_claim_txs(block.transactions, height + index)
+                pending_undo.append((height+index, undo,))
+            except:
+                self.logger.exception(f'Error while advancing transaction in new block.')
+                raise
         self.db.write_undo(pending_undo)
 
     def advance_claim_txs(self, txs, height):
@@ -39,18 +43,23 @@ class LBRYBlockProcessor(BlockProcessor):
         for position, (etx, txid) in enumerate(txs):
             update_inputs.clear()
             tx = Transaction(etx.serialize(), height=height, position=position)
+            tx_saved = False
             for index, output in enumerate(tx.outputs):
-                if output.is_support:
-                    sqldb.insert_support(output)
-                elif output.script.is_claim_name:
+                #if output.is_support:
+                #    tx_saved = tx_saved or sqldb.insert_tx(tx)
+                #    sqldb.insert_support(output)
+                #elif output.script.is_claim_name:
+                if output.script.is_claim_name:
                     add_undo(self.advance_claim_name_transaction(output, height, txid, index))
-                    sqldb.insert_claim(output)
+                #    tx_saved = tx_saved or sqldb.insert_tx(tx)
+                #    sqldb.insert_claim(output)
                 elif output.script.is_update_claim:
                     update_input = self.db.get_update_input(output.claim_hash, tx.inputs)
                     if update_input:
                         update_inputs.add(update_input)
                         add_undo(self.advance_update_claim(output, height, txid, index))
-                        sqldb.update_claim(output)
+                #        tx_saved = tx_saved or sqldb.insert_tx(tx)
+                #        sqldb.update_claim(output)
                     else:
                         info = (hash_to_hex_str(txid), output.claim_id,)
                         self.logger.error("REJECTED: {} updating {}".format(*info))
@@ -60,11 +69,12 @@ class LBRYBlockProcessor(BlockProcessor):
                     abandoned_claim_id = self.db.abandon_spent(txin.txo_ref.tx_ref.hash, txin.txo_ref.position)
                     if abandoned_claim_id:
                         add_undo((abandoned_claim_id, self.db.get_claim_info(abandoned_claim_id)))
-                        sqldb.delete_claim(abandoned_claim_id)
+                        #sqldb.delete_claim(abandoned_claim_id)
                     else:
                         possible_supports.append(txin)
-            sqldb.maybe_delete_supports(possible_supports)
-        sqldb.update_claimtrie(height)
+            #sqldb.maybe_delete_supports(possible_supports)
+        #sqldb.delete_dereferenced_transactions()
+        #sqldb.update_claimtrie(height)
         return undo_info
 
     def advance_update_claim(self, output: Output, height, txid, nout):

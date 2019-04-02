@@ -27,13 +27,14 @@ class Output(BaseOutput):
     script: OutputScript
     script_class = OutputScript
 
-    __slots__ = 'channel', 'private_key'
+    __slots__ = 'channel', 'private_key', 'meta'
 
     def __init__(self, *args, channel: Optional['Output'] = None,
                  private_key: Optional[str] = None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.channel = channel
         self.private_key = private_key
+        self.meta = {}
 
     def update_annotations(self, annotated):
         super().update_annotations(annotated)

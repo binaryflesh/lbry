@@ -29,6 +29,7 @@ class LBRYElectrumX(ElectrumX):
         super().set_request_handlers(ptuple)
         handlers = {
             'blockchain.transaction.get_height': self.transaction_get_height,
+            'blockchain.claimtrie.search': self.claimtrie_search,
             'blockchain.claimtrie.getclaimbyid': self.claimtrie_getclaimbyid,
             'blockchain.claimtrie.getclaimsforname': self.claimtrie_getclaimsforname,
             'blockchain.claimtrie.getclaimsbyids': self.claimtrie_getclaimsbyids,
@@ -200,6 +201,11 @@ class LBRYElectrumX(ElectrumX):
             del claims['nLastTakeoverHeight']
             return claims
         return {}
+
+    async def claimtrie_search(self, **kwargs):
+        if 'claim_id' in kwargs:
+            self.assert_claim_id(kwargs['claim_id'])
+        return self.db.sqldb.claim_search(kwargs)
 
     async def batched_formatted_claims_from_daemon(self, claim_ids):
         claims = await self.daemon.getclaimsbyids(claim_ids)

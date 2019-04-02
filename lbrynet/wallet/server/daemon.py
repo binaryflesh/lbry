@@ -20,6 +20,11 @@ class LBCDaemon(Daemon):
         return await super().getrawtransaction(hex_hash=hex_hash, verbose=verbose)
 
     @handles_errors
+    async def claim_search(self, kwargs):
+        '''Given a claim id, retrieves claim information.'''
+        return await self._send_single('claim_search', kwargs)
+
+    @handles_errors
     async def getclaimbyid(self, claim_id):
         '''Given a claim id, retrieves claim information.'''
         return await self._send_single('getclaimbyid', (claim_id,))

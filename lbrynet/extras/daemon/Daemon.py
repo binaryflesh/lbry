@@ -5,6 +5,7 @@ import json
 import time
 import inspect
 import typing
+import base64
 import base58
 import random
 from urllib.parse import urlencode, quote
@@ -35,6 +36,7 @@ from lbrynet.wallet.transaction import Transaction, Output, Input
 from lbrynet.wallet.account import Account as LBCAccount
 from lbrynet.wallet.dewies import dewies_to_lbc, lbc_to_dewies
 from lbrynet.schema.claim import Claim
+from lbrynet.schema.page import from_page
 from lbrynet.schema.uri import parse_lbry_uri, URIParseError
 from lbrynet.extras.daemon.comment_client import jsonrpc_batch, jsonrpc_post, rpc_body
 
@@ -1558,17 +1560,15 @@ class Daemon(metaclass=JSONRPCServerType):
         )
 
     @requires(WALLET_COMPONENT)
-    async def jsonrpc_claim_search(
-            self, name=None, claim_id=None, txid=None, nout=None,
-            channel_id=None, winning=False, page=1, page_size=10):
+    async def jsonrpc_claim_search(self, **kwargs):
         """
         Search for stream and channel claims on the blockchain.
 
         Use --channel_id=<channel_id> to list all stream claims in a channel.
 
         Usage:
-            claim_search [<name> | --name=<name>] [--claim_id=<claim_id>] [--txid=<txid> --nout=<nout>]
-                         [--channel_id=<channel_id>] [--winning] [--page=<page>] [--page_size=<page_size>]
+            claim_search [--name=<name>] [--claim_id=<claim_id>] [--txid=<txid> --nout=<nout>]
+                         [--channel_id=<channel_id>] [--is_winning] [--page=<page>] [--page_size=<page_size>]
 
         Options:
             --name=<name>             : (str) find claims with this name
@@ -1576,42 +1576,19 @@ class Daemon(metaclass=JSONRPCServerType):
             --txid=<txid>             : (str) find a claim with this txid:nout
             --nout=<nout>             : (str) find a claim with this txid:nout
             --channel_id=<channel_id> : (str) limit search to specific channel claim id (returns stream claims)
-            --winning                 : (bool) limit to winning claims
-            --page=<page>             : (int) page to return during paginating
-            --page_size=<page_size>   : (int) number of items on page during pagination
+            --is_winning              : (bool) limit to winning claims
+            --page=<page>             : (int) page to return while paginating (default: 1)
+            --page_size=<page_size>   : (int) number of items on page during pagination (default: 10, max: 50)
 
         Returns: {Paginated[Output]}
         """
-        claims = []
-        if name is not None:
-            claims = await self.ledger.network.get_claims_for_name(name)
-        elif claim_id is not None:
-            claim = await self.wallet_manager.get_claim_by_claim_id(claim_id)
-            if claim and claim != 'claim not found':
-                claims = {'claims': [claim]}
-        elif txid is not None and nout is not None:
-            claim = await self.wallet_manager.get_claim_by_outpoint(txid, int(nout))
-            if claim and claim != 'claim not found':
-                claims = {'claims': [claim]}
-        elif channel_id is not None:
-            claim = await self.wallet_manager.get_claim_by_claim_id(channel_id)
-            if claim and claim != 'claim not found':
-                channel_url = f"{claim['name']}#{claim['claim_id']}"
-                resolve = await self.resolve(channel_url, page=page, page_size=page_size)
-                resolve = resolve.get(channel_url, {})
-                claims = resolve.get('claims_in_channel', []) or []
-                total_pages = 0
-                if claims:
-                    total_pages = int((resolve['total_claims'] + (page_size-1)) / page_size)
-                #sort_claim_results(claims)
-                return {"items": claims, "total_pages": total_pages, "page": page, "page_size": page_size}
-        else:
-            raise Exception("Must specify either name, claim_id, or txid:nout.")
-        if claims:
-            resolutions = await self.resolve(*(f"{claim['name']}#{claim['claim_id']}" for claim in claims['claims']))
-            claims = [value.get('claim', value.get('certificate')) for value in resolutions.values()]
-            sort_claim_results(claims)
-        return {"items": claims, "total_pages": 1, "page": 1, "page_size": len(claims)}
+        page, page_size = abs(kwargs.pop('page', 1)), min(abs(kwargs.pop('page_size', 10)), 50)
+        kwargs.update({'offset': page_size * (page-1), 'limit': page_size})
+        items, offset, total = from_page(base64.b64decode(await self.ledger.network.claim_search(**kwargs)))
+        return {
+            "items": items, "page": page, "page_size": page_size,
+            "total_pages": int((total + (page_size-1)) / page_size)
+        }
 
     CHANNEL_DOC = """
     Create, update, abandon and list your channel claims.

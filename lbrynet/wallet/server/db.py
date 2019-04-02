@@ -2,13 +2,14 @@ import msgpack
 import struct
 import sqlite3
 import time
-from binascii import hexlify
+from base64 import b64encode
 from typing import Union, Tuple, List
 
 from torba.server.db import DB
 from torba.server.hash import hash_to_hex_str
 from torba.client.basedatabase import query
 
+from lbrynet.schema.page import to_page
 from lbrynet.wallet.server.model import ClaimInfo
 
 
@@ -18,6 +19,16 @@ class SQLDB:
 
     PRAGMAS = """
         pragma journal_mode=WAL;
+    """
+
+    CREATE_TX_TABLE = """
+        create table if not exists tx (
+            txid bytes not null,
+            tx bytes not null,
+            pos integer not null,
+            block integer not null
+        );
+        create index if not exists tx_txid_idx on tx (txid);
     """
 
     CREATE_CLAIM_TABLE = """
@@ -32,6 +43,7 @@ class SQLDB:
             claim_name text not null,
             channel_id bytes
         );
+        create index if not exists claim_txid_idx on claim (txid);
         create index if not exists claim_claim_id_idx on claim (claim_id);
         create index if not exists claim_claim_name_idx on claim (claim_name);
         create index if not exists claim_channel_id_idx on claim (channel_id);
@@ -45,7 +57,9 @@ class SQLDB:
             amount integer not null,
             claim_id bytes not null
         );
+        create index if not exists support_txid_idx on support (txid);
         create index if not exists support_claim_id_idx on support (claim_id);
+        create index if not exists support_block_idx on support (block);
     """
 
     CREATE_CLAIMTRIE_TABLE = """
@@ -92,6 +106,7 @@ class SQLDB:
 
     CREATE_TABLES_QUERY = (
         PRAGMAS +
+        CREATE_TX_TABLE +
         CREATE_CLAIM_TABLE +
         CREATE_SUPPORT_TABLE +
         CREATE_CLAIMTRIE_TABLE +
@@ -106,6 +121,7 @@ class SQLDB:
 
     def open(self):
         self.db = sqlite3.connect(self._db_path, check_same_thread=False)
+        self.db.row_factory = sqlite3.Row
         self.db.executescript(self.CREATE_TABLES_QUERY)
 
     def close(self):
@@ -138,23 +154,34 @@ class SQLDB:
         )
         return sql, values
 
-    @staticmethod
-    def claim_to_row(txo, channel_hash):
-        tx = txo.tx_ref.tx
-        return {
-            'txid': sqlite3.Binary(tx.hash),
-            'nout': txo.position,
-            'block': tx.height,
-            'amount': txo.amount,
-            'claim_id': sqlite3.Binary(txo.claim_hash),
-            'claim_name': txo.claim_name,
-            'channel_id': sqlite3.Binary(channel_hash) if channel_hash is not None else None
-        }
+    def insert_tx(self, tx):
+        self.db.execute(*self._insert_sql(
+            'tx', {
+                'txid': sqlite3.Binary(tx.hash),
+                'tx': sqlite3.Binary(tx.raw),
+                'pos': tx.position,
+                'block': tx.height
+            }
+        ))
+        return True
 
     def insert_claim(self, txo):
+        try:
+            txo.claim
+        except:
+            return
         height = txo.tx_ref.tx.height
+        tx, channel_hash = txo.tx_ref.tx, None
         self.db.execute(*self._insert_sql(
-            "claim", self.claim_to_row(txo, None)
+            'claim', {
+                'txid': sqlite3.Binary(tx.hash),
+                'nout': txo.position,
+                'block': tx.height,
+                'amount': txo.amount,
+                'claim_id': sqlite3.Binary(txo.claim_hash),
+                'claim_name': txo.claim_name,
+                'channel_id': sqlite3.Binary(channel_hash) if channel_hash is not None else None
+            }
         ))
         claim_hash = sqlite3.Binary(txo.claim_hash)
         if txo.claim.is_channel:
@@ -163,7 +190,7 @@ class SQLDB:
             claim = txo.claim.stream
         for tag in claim.tags:
             self.db.execute(*self._insert_sql(
-                "tag", {
+                'tag', {
                     'tag': tag,
                     'claim_id': claim_hash,
                     'block': height
@@ -171,7 +198,7 @@ class SQLDB:
             ))
         for location in claim.locations:
             self.db.execute(*self._insert_sql(
-                "location", {
+                'location', {
                     'country': location.message.country,
                     'state': location.message.state,
                     'claim_id': claim_hash,
@@ -180,7 +207,7 @@ class SQLDB:
             ))
         for lang in claim.languages:
             self.db.execute(*self._insert_sql(
-                "lang", {
+                'lang', {
                     'lang': lang.message.language,
                     'claim_id': claim_hash,
                     'block': height
@@ -195,7 +222,7 @@ class SQLDB:
         claim_hash = sqlite3.Binary(claim_hash)
         tables = ['claim', 'tag', 'lang', 'location']
         if permanent:
-            self.db.execute(f"UPDATE claimtrie SET claim_id = NULL WHERE claim_id = ?", (claim_hash,))
+            tables.append('claimtrie')
             tables.append('support')
         for table in tables:
             self.db.execute(f"DELETE FROM {table} WHERE claim_id = ?", (claim_hash,))
@@ -203,7 +230,7 @@ class SQLDB:
     def insert_support(self, txo):
         tx = txo.tx_ref.tx
         self.db.execute(*self._insert_sql(
-            "support", {
+            'support', {
                 'txid': sqlite3.Binary(tx.hash),
                 'nout': txo.position,
                 'block': tx.height,
@@ -216,6 +243,14 @@ class SQLDB:
         for txi in txis:
             txid, nout = sqlite3.Binary(txi.txo_ref.tx_ref.hash), txi.txo_ref.position
             self.db.execute(f"DELETE FROM support WHERE txid = ? AND nout = ?", (txid, nout))
+
+    def delete_dereferenced_transactions(self):
+        self.db.execute("""
+            DELETE FROM tx WHERE (
+                (SELECT COUNT(*) FROM claim WHERE claim.txid=tx.txid) +
+                (SELECT COUNT(*) FROM support WHERE support.txid=tx.txid)
+                ) = 0
+        """)
 
     def update_claimtrie(self, height):
         cur = self.db.cursor()
@@ -257,39 +292,69 @@ class SQLDB:
                     }, 'claim_name = ?', (claim_name,)
                 ))
 
-    def select_claims(self, cols, **constraints):
+    def get_transactions(self, txids):
         cur = self.db.cursor()
-        cur.execute(*query(
-            "SELECT {} FROM claim LEFT JOIN claimtrie USING (claim_id)".format(cols), **constraints
-        ))
+        cur.execute(*query("SELECT * FROM tx", **{'txid__in': txids}))
         return cur.fetchall()
 
-    def get_claims(self, **constraints):
-        if 'order_by' not in constraints:
-            constraints['order_by'] = ["claim.block DESC"]
+    def get_claims(self, cols, **constraints):
         if 'is_winning' in constraints:
             if constraints['is_winning']:
                 constraints['claimtrie.claim_id__is_not_null'] = ''
             else:
                 constraints['claimtrie.claim_id__is_null'] = ''
             del constraints['is_winning']
-        return [{
-            'claim_name': r[0],
-            'claim_id': hexlify(r[1][::-1]).decode(),
-            'txid': hexlify(r[2][::-1]).decode(),
-            'nout': r[3], 'amount': r[4], 'effective_amount': r[5], 'trending_amount': r[6],
-            'is_winning': bool(r[7])
-            } for r in self.select_claims(
-            "claim.claim_name, claim.claim_id, txid, nout, "
-            "amount, effective_amount, trending_amount, "
-            "claimtrie.claim_id", **constraints
-        )]
+        if 'name' in constraints:
+            constraints['claim.claim_name__like'] = constraints['name']
+            del constraints['name']
+        cur = self.db.cursor()
+        cur.execute(*query(
+            f"""
+            SELECT {cols} FROM claim
+            LEFT JOIN claimtrie USING (claim_id)
+            LEFT JOIN claim as channel ON (claim.channel_id=channel.claim_id)
+            """, **constraints
+        ))
+        return cur.fetchall()
+
+    def get_claims_count(self, **constraints):
+        constraints.pop('offset', None)
+        constraints.pop('limit', None)
+        constraints.pop('order_by', None)
+        count = self.get_claims('count(*)', **constraints)
+        return count[0][0]
+
+    SEARCH_PARAMS = {
+        'name', 'claim_id', 'txid', 'nout', 'channel_id', 'is_winning', 'limit', 'offset'
+    }
+
+    def claim_search(self, constraints):
+        assert set(constraints).issubset(self.SEARCH_PARAMS), \
+            f"Search query contains invalid arguments: {set(constraints).difference(self.SEARCH_PARAMS)}"
+        total = self.get_claims_count(**constraints)
+        constraints['offset'] = abs(constraints.get('offset', 0))
+        constraints['limit'] = min(abs(constraints.get('limit', 10)), 50)
+        constraints['order_by'] = ["claim.block DESC"]
+        claims = self.get_claims(
+            """
+            claim.txid, claim.nout, claimtrie.claim_id as is_winning,
+            claim.effective_amount, claim.trending_amount,
+            channel.txid as channel_txid, channel.nout as channel_nout
+            """, **constraints
+        )
+        txids = set()
+        for claim in claims:
+            txids.add(sqlite3.Binary(claim['txid']))
+            if claim['channel_txid']:
+                txids.add(sqlite3.Binary(claim['channel_txid']))
+        txs = self.get_transactions(txids)
+        return b64encode(to_page(claims, txs, constraints['offset'], total)).decode()
 
 
 class LBRYDB(DB):
 
     def __init__(self, *args, **kwargs):
-        self.sqldb = SQLDB(':memory:')
+        self.sqldb = SQLDB('/tmp/testxt/sqlite.db')
         self.claim_cache = {}
         self.claims_signed_by_cert_cache = {}
         self.outpoint_to_claim_id_cache = {}
@@ -390,17 +455,17 @@ class LBRYDB(DB):
     def abandon_spent(self, tx_hash, tx_idx):
         claim_id = self.get_claim_id_from_outpoint(tx_hash, tx_idx)
         if claim_id:
-            self.logger.info("[!] Abandon: {}".format(hash_to_hex_str(claim_id)))
+            self.logger.debug("[!] Abandon: {}".format(hash_to_hex_str(claim_id)))
             self.pending_abandons.setdefault(claim_id, []).append((tx_hash, tx_idx,))
             return claim_id
 
     def put_claim_id_for_outpoint(self, tx_hash, tx_idx, claim_id):
-        self.logger.info("[+] Adding outpoint: {}:{} for {}.".format(hash_to_hex_str(tx_hash), tx_idx,
+        self.logger.debug("[+] Adding outpoint: {}:{} for {}.".format(hash_to_hex_str(tx_hash), tx_idx,
                                                                      hash_to_hex_str(claim_id) if claim_id else None))
         self.outpoint_to_claim_id_cache[tx_hash + struct.pack('>I', tx_idx)] = claim_id
 
     def remove_claim_id_for_outpoint(self, tx_hash, tx_idx):
-        self.logger.info("[-] Remove outpoint: {}:{}.".format(hash_to_hex_str(tx_hash), tx_idx))
+        self.logger.debug("[-] Remove outpoint: {}:{}.".format(hash_to_hex_str(tx_hash), tx_idx))
         self.outpoint_to_claim_id_cache[tx_hash + struct.pack('>I', tx_idx)] = None
 
     def get_claim_id_from_outpoint(self, tx_hash, tx_idx):
@@ -415,19 +480,19 @@ class LBRYDB(DB):
 
     def put_claim_id_signed_by_cert_id(self, cert_id, claim_id):
         msg = "[+] Adding signature: {} - {}".format(hash_to_hex_str(claim_id), hash_to_hex_str(cert_id))
-        self.logger.info(msg)
+        self.logger.debug(msg)
         certs = self.get_signed_claim_ids_by_cert_id(cert_id)
         certs.append(claim_id)
         self.claims_signed_by_cert_cache[cert_id] = certs
 
     def remove_certificate(self, cert_id):
         msg = "[-] Removing certificate: {}".format(hash_to_hex_str(cert_id))
-        self.logger.info(msg)
+        self.logger.debug(msg)
         self.claims_signed_by_cert_cache[cert_id] = []
 
     def remove_claim_from_certificate_claims(self, cert_id, claim_id):
         msg = "[-] Removing signature: {} - {}".format(hash_to_hex_str(claim_id), hash_to_hex_str(cert_id))
-        self.logger.info(msg)
+        self.logger.debug(msg)
         certs = self.get_signed_claim_ids_by_cert_id(cert_id)
         if claim_id in certs:
             certs.remove(claim_id)
@@ -438,7 +503,7 @@ class LBRYDB(DB):
         return ClaimInfo.from_serialized(serialized) if serialized else None
 
     def put_claim_info(self, claim_id, claim_info):
-        self.logger.info("[+] Adding claim info for: {}".format(hash_to_hex_str(claim_id)))
+        self.logger.debug("[+] Adding claim info for: {}".format(hash_to_hex_str(claim_id)))
         self.claim_cache[claim_id] = claim_info.serialized
 
     def get_update_input(self, claim_id, inputs):

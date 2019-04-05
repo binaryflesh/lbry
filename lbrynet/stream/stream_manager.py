@@ -346,6 +346,8 @@ class StreamManager:
             if updated_stream:
                 return updated_stream
 
+            content_fee = None
+
             # check that the fee is payable
             if not to_replace and claim.stream.has_fee:
                 fee_amount = round(exchange_rate_manager.convert_currency(
@@ -364,9 +366,11 @@ class StreamManager:
                     log.warning(msg)
                     raise InsufficientFundsError(msg)
                 fee_address = claim.stream.fee.address
-                await self.wallet.send_amount_to_address(
+
+                content_fee = await self.wallet.send_amount_to_address(
                     lbc_to_dewies(str(fee_amount)), fee_address.encode('latin1')
                 )
+
                 log.info("paid fee of %s for %s", fee_amount, uri)
 
             download_directory = download_directory or self.config.download_dir
@@ -374,7 +378,8 @@ class StreamManager:
                 download_dir, file_name = None, None
             stream = ManagedStream(
                 self.loop, self.config, self.blob_manager, claim.stream.sd_hash, download_directory,
-                file_name, ManagedStream.STATUS_RUNNING, analytics_manager=self.analytics_manager
+                file_name, ManagedStream.STATUS_RUNNING, content_fee=content_fee,
+                analytics_manager=self.analytics_manager
             )
             try:
                 await asyncio.wait_for(stream.setup(

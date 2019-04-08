@@ -1,5 +1,4 @@
 from torba.client.basenetwork import BaseNetwork
-from torba.rpc.jsonrpc import Request
 
 
 class Network(BaseNetwork):

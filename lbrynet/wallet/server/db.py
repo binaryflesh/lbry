@@ -1,16 +1,14 @@
-import msgpack
-import struct
 import sqlite3
-import time
 from base64 import b64encode
-from typing import Union, Tuple, List
+from typing import Union, Tuple, Set
 
 from torba.server.db import DB
-from torba.server.hash import hash_to_hex_str
-from torba.client.basedatabase import query
+from torba.server.util import class_logger
+from torba.client.basedatabase import query, constraints_to_sql
+from google.protobuf.message import DecodeError
 
 from lbrynet.schema.page import to_page
-from lbrynet.wallet.server.model import ClaimInfo
+from lbrynet.wallet.transaction import Transaction, Output
 
 
 class SQLDB:
@@ -23,85 +21,65 @@ class SQLDB:
 
     CREATE_TX_TABLE = """
         create table if not exists tx (
-            txid bytes not null,
-            tx bytes not null,
-            pos integer not null,
-            block integer not null
+            tx_hash bytes primary key,
+            raw bytes not null,
+            position integer not null,
+            height integer not null
         );
-        create index if not exists tx_txid_idx on tx (txid);
     """
 
     CREATE_CLAIM_TABLE = """
         create table if not exists claim (
-            txid bytes not null,
-            nout integer not null,
-            block integer not null,
+            claim_hash bytes primary key,
+            tx_hash bytes not null,
+            txo_hash bytes not null,
+            height integer not null,
+            activation_height integer not null default 0,
             amount integer not null,
             effective_amount integer not null default 0,
             trending_amount integer not null default 0,
-            claim_id bytes not null,
             claim_name text not null,
-            channel_id bytes
+            channel_hash bytes
         );
-        create index if not exists claim_txid_idx on claim (txid);
-        create index if not exists claim_claim_id_idx on claim (claim_id);
+        create index if not exists claim_tx_hash_idx on claim (tx_hash);
+        create index if not exists claim_txo_hash_idx on claim (txo_hash);
+        create index if not exists claim_activation_height_idx on claim (activation_height);
+        create index if not exists claim_channel_hash_idx on claim (channel_hash);
         create index if not exists claim_claim_name_idx on claim (claim_name);
-        create index if not exists claim_channel_id_idx on claim (channel_id);
     """
 
     CREATE_SUPPORT_TABLE = """
         create table if not exists support (
-            txid bytes not null,
-            nout integer not null,
-            block integer not null,
+            txo_hash bytes primary key,
+            tx_hash bytes not null,
+            claim_hash bytes not null,
+            position integer not null,
+            height integer not null,
             amount integer not null,
-            claim_id bytes not null
+            is_comment bool not null default false
         );
-        create index if not exists support_txid_idx on support (txid);
-        create index if not exists support_claim_id_idx on support (claim_id);
-        create index if not exists support_block_idx on support (block);
-    """
-
-    CREATE_CLAIMTRIE_TABLE = """
-        create table if not exists claimtrie (
-            claim_name text not null,
-            claim_id bytes not null,
-            block integer not null
-        );
-        create index if not exists claimtrie_claim_id_idx on claimtrie (claim_id);
-        create index if not exists claimtrie_claim_name_idx on claimtrie (claim_name);
+        create index if not exists support_tx_hash_idx on support (tx_hash);
+        create index if not exists support_claim_hash_idx on support (claim_hash, height);
     """
 
     CREATE_TAG_TABLE = """
         create table if not exists tag (
-            tag text,
-            claim_id bytes,
-            block integer
+            tag text not null,
+            txo_hash bytes not null,
+            height integer not null
         );
         create index if not exists tag_tag_idx on tag (tag);
-        create index if not exists tag_claim_id_idx on tag (claim_id);
+        create index if not exists tag_txo_hash_idx on tag (txo_hash);
+        create index if not exists tag_height_idx on tag (height);
     """
 
-    CREATE_LOCATION_TABLE = """
-        create table if not exists location (
-            country integer,
-            state text,
-            claim_id bytes,
-            block integer
+    CREATE_CLAIMTRIE_TABLE = """
+        create table if not exists claimtrie (
+            claim_name text primary key,
+            claim_hash bytes not null,
+            last_take_over_height integer not null
         );
-        create index if not exists location_country_idx on location (country);
-        create index if not exists location_state_idx on location (state);
-        create index if not exists location_claim_id_idx on location (claim_id);
-    """
-
-    CREATE_LANGUAGE_TABLE = """
-        create table if not exists lang (
-            lang integer,
-            claim_id bytes,
-            block integer
-        );
-        create index if not exists lang_lang_idx on lang (lang);
-        create index if not exists lang_claim_id_idx on lang (claim_id);
+        create index if not exists claimtrie_claim_hash_idx on claimtrie (claim_hash);
     """
 
     CREATE_TABLES_QUERY = (
@@ -110,17 +88,16 @@ class SQLDB:
         CREATE_CLAIM_TABLE +
         CREATE_SUPPORT_TABLE +
         CREATE_CLAIMTRIE_TABLE +
-        CREATE_TAG_TABLE +
-        CREATE_LOCATION_TABLE +
-        CREATE_LANGUAGE_TABLE
+        CREATE_TAG_TABLE
     )
 
     def __init__(self, path):
         self._db_path = path
         self.db = None
+        self.logger = class_logger(__name__, self.__class__.__name__)
 
     def open(self):
-        self.db = sqlite3.connect(self._db_path, check_same_thread=False)
+        self.db = sqlite3.connect(self._db_path, isolation_level=None, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(self.CREATE_TABLES_QUERY)
 
@@ -128,16 +105,14 @@ class SQLDB:
         self.db.close()
 
     @staticmethod
-    def _insert_sql(table: str, data: dict, ignore_duplicate: bool = False) -> Tuple[str, List]:
+    def _insert_sql(table: str, data: dict) -> Tuple[str, list]:
         columns, values = [], []
         for column, value in data.items():
             columns.append(column)
             values.append(value)
-        or_ignore = ""
-        if ignore_duplicate:
-            or_ignore = " OR IGNORE"
-        sql = "INSERT{} INTO {} ({}) VALUES ({})".format(
-            or_ignore, table, ', '.join(columns), ', '.join(['?'] * len(values))
+        sql = (
+            f"INSERT INTO {table} ({', '.join(columns)}) "
+            f"VALUES ({', '.join(['?'] * len(values))})"
         )
         return sql, values
 
@@ -149,152 +124,172 @@ class SQLDB:
             columns.append("{} = ?".format(column))
             values.append(value)
         values.extend(constraints)
-        sql = "UPDATE {} SET {} WHERE {}".format(
-            table, ', '.join(columns), where
-        )
-        return sql, values
+        return f"UPDATE {table} SET {', '.join(columns)} WHERE {where}", values
 
-    def insert_tx(self, tx):
-        self.db.execute(*self._insert_sql(
-            'tx', {
-                'txid': sqlite3.Binary(tx.hash),
-                'tx': sqlite3.Binary(tx.raw),
-                'pos': tx.position,
-                'block': tx.height
-            }
-        ))
-        return True
+    @staticmethod
+    def _delete_sql(table: str, constraints: dict) -> Tuple[str, dict]:
+        where, values = constraints_to_sql(constraints)
+        return f"DELETE FROM {table} WHERE {where}", values
 
-    def insert_claim(self, txo):
-        try:
-            txo.claim
-        except:
-            return
-        height = txo.tx_ref.tx.height
-        tx, channel_hash = txo.tx_ref.tx, None
-        self.db.execute(*self._insert_sql(
-            'claim', {
-                'txid': sqlite3.Binary(tx.hash),
-                'nout': txo.position,
-                'block': tx.height,
+    def execute(self, *args):
+        return self.db.execute(*args)
+
+    def begin(self):
+        self.execute('begin;')
+
+    def commit(self):
+        self.execute('commit;')
+
+    def insert_txs(self, txs: Set[Transaction]):
+        if txs:
+            self.db.executemany(
+                "INSERT INTO tx (tx_hash, raw, position, height) VALUES (?, ?, ?, ?)",
+                [(sqlite3.Binary(tx.hash), sqlite3.Binary(tx.raw), tx.position, tx.height) for tx in txs]
+            )
+
+    def _upsertable_claims(self, txos: Set[Output]):
+        claims, tags = [], []
+        for txo in txos:
+            tx = txo.tx_ref.tx
+            try:
+                assert txo.claim_name
+            except (AssertionError, UnicodeDecodeError):
+                self.logger.exception(f"Could not decode claim name for {tx.id}:{txo.position}.")
+                continue
+            try:
+                claim = txo.claim
+                if claim.is_channel:
+                    metadata = claim.channel
+                else:
+                    metadata = claim.stream
+            except DecodeError:
+                self.logger.exception(f"Could not parse claim protobuf for {tx.id}:{txo.position}.")
+                continue
+            txo_hash = sqlite3.Binary(txo.ref.hash)
+            channel_hash = sqlite3.Binary(claim.signing_channel_hash) if claim.signing_channel_hash else None
+            claims.append({
+                'claim_hash': sqlite3.Binary(txo.claim_hash),
+                'tx_hash': sqlite3.Binary(tx.hash),
+                'txo_hash': txo_hash,
+                'channel_hash': channel_hash,
                 'amount': txo.amount,
-                'claim_id': sqlite3.Binary(txo.claim_hash),
                 'claim_name': txo.claim_name,
-                'channel_id': sqlite3.Binary(channel_hash) if channel_hash is not None else None
-            }
-        ))
-        claim_hash = sqlite3.Binary(txo.claim_hash)
-        if txo.claim.is_channel:
-            claim = txo.claim.channel
-        else:
-            claim = txo.claim.stream
-        for tag in claim.tags:
-            self.db.execute(*self._insert_sql(
-                'tag', {
-                    'tag': tag,
-                    'claim_id': claim_hash,
-                    'block': height
-                }
+                'height': tx.height
+            })
+            for tag in metadata.tags:
+                tags.append((tag, txo_hash, tx.height))
+        if tags:
+            self.db.executemany(
+                "INSERT INTO tag (tag, txo_hash, height) VALUES (?, ?, ?)", tags
+            )
+        return claims
+
+    def insert_claims(self, txos: Set[Output]):
+        claims = self._upsertable_claims(txos)
+        if claims:
+            self.db.executemany(
+                "INSERT INTO claim (claim_hash, tx_hash, txo_hash, channel_hash, amount, claim_name, height) "
+                "VALUES (:claim_hash, :tx_hash, :txo_hash, :channel_hash, :amount, :claim_name, :height) ",
+                claims
+            )
+
+    def update_claims(self, txos: Set[Output]):
+        claims = self._upsertable_claims(txos)
+        if claims:
+            self.db.executemany(
+                "UPDATE claim SET "
+                "    tx_hash=:tx_hash, txo_hash=:txo_hash, channel_hash=:channel_hash, "
+                "    amount=:amount, height=:height "
+                "WHERE claim_hash=:claim_hash;",
+                claims
+            )
+
+    def clear_claim_metadata(self, txo_hashes: Set[bytes]):
+        """ Deletes metadata associated with claim in case of an update or an abandon. """
+        if txo_hashes:
+            binary_txo_hashes = [sqlite3.Binary(txo_hash) for txo_hash in txo_hashes]
+            for table in ('tag',):  # 'language', 'location', etc
+                self.execute(*self._delete_sql(table, {'txo_hash__in': binary_txo_hashes}))
+
+    def abandon_claims(self, claim_hashes: Set[bytes]):
+        """ Deletes claim supports and from claimtrie in case of an abandon. """
+        if claim_hashes:
+            binary_claim_hashes = [sqlite3.Binary(claim_hash) for claim_hash in claim_hashes]
+            for table in ('claim', 'support', 'claimtrie'):
+                self.execute(*self._delete_sql(table, {'claim_hash__in': binary_claim_hashes}))
+
+    def split_inputs_into_claims_and_other(self, txis):
+        all = set(txi.txo_ref.hash for txi in txis)
+        claims = dict(self.execute(*query(
+            "SELECT txo_hash, claim_hash FROM claim",
+            txo_hash__in=[sqlite3.Binary(txo_hash) for txo_hash in all]
+        )))
+        return claims, all-set(claims)
+
+    def insert_supports(self, txos: Set[Output]):
+        supports = []
+        for txo in txos:
+            tx = txo.tx_ref.tx
+            supports.append((
+                sqlite3.Binary(txo.ref.hash), sqlite3.Binary(tx.hash),
+                sqlite3.Binary(txo.claim_hash), tx.position, tx.height,
+                txo.amount, False
             ))
-        for location in claim.locations:
-            self.db.execute(*self._insert_sql(
-                'location', {
-                    'country': location.message.country,
-                    'state': location.message.state,
-                    'claim_id': claim_hash,
-                    'block': height
-                }
+        if supports:
+            self.db.executemany(
+                "INSERT INTO support (txo_hash, tx_hash, claim_hash, position, height, amount, is_comment) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)", supports
+            )
+
+    def delete_other_txos(self, txo_hashes: Set[bytes]):
+        if txo_hashes:
+            self.execute(*self._delete_sql(
+                'support', {'txo_hash__in': [sqlite3.Binary(txo_hash) for txo_hash in txo_hashes]}
             ))
-        for lang in claim.languages:
-            self.db.execute(*self._insert_sql(
-                'lang', {
-                    'lang': lang.message.language,
-                    'claim_id': claim_hash,
-                    'block': height
-                }
-            ))
-
-    def update_claim(self, txo):
-        self.delete_claim(txo.claim_hash, permanent=False)
-        self.insert_claim(txo)
-
-    def delete_claim(self, claim_hash, permanent=True):
-        claim_hash = sqlite3.Binary(claim_hash)
-        tables = ['claim', 'tag', 'lang', 'location']
-        if permanent:
-            tables.append('claimtrie')
-            tables.append('support')
-        for table in tables:
-            self.db.execute(f"DELETE FROM {table} WHERE claim_id = ?", (claim_hash,))
-
-    def insert_support(self, txo):
-        tx = txo.tx_ref.tx
-        self.db.execute(*self._insert_sql(
-            'support', {
-                'txid': sqlite3.Binary(tx.hash),
-                'nout': txo.position,
-                'block': tx.height,
-                'amount': txo.amount,
-                'claim_id': sqlite3.Binary(txo.claim_hash)
-            }
-        ))
-
-    def maybe_delete_supports(self, txis):
-        for txi in txis:
-            txid, nout = sqlite3.Binary(txi.txo_ref.tx_ref.hash), txi.txo_ref.position
-            self.db.execute(f"DELETE FROM support WHERE txid = ? AND nout = ?", (txid, nout))
 
     def delete_dereferenced_transactions(self):
-        self.db.execute("""
+        self.execute("""
             DELETE FROM tx WHERE (
-                (SELECT COUNT(*) FROM claim WHERE claim.txid=tx.txid) +
-                (SELECT COUNT(*) FROM support WHERE support.txid=tx.txid)
+                (SELECT COUNT(*) FROM claim WHERE claim.tx_hash=tx.tx_hash) +
+                (SELECT COUNT(*) FROM support WHERE support.tx_hash=tx.tx_hash)
                 ) = 0
         """)
 
     def update_claimtrie(self, height):
-        cur = self.db.cursor()
-        cur.execute(f"""
+        # 1. Update `effective_amount` and `trending_amount`.
+        # 2a. Leave activation_height unchanged if it was set before.
+        # 2b. Set activation_height to current if no existing name winner (didn't exist or was abandoned).
+        # 2c. Calculate activation_height using activation delay formula.
+        self.execute(f"""
             UPDATE claim SET
-              effective_amount = COALESCE(
-                (SELECT SUM(amount) FROM support WHERE support.claim_id=claim.claim_id), 0
-              ) + claim.amount,
-              trending_amount = COALESCE(
-                (SELECT SUM(amount) FROM support WHERE
-                   support.claim_id=claim.claim_id AND support.block > {height-self.TRENDING_BLOCKS}), 0
-              )
+                effective_amount = COALESCE(
+                    (SELECT SUM(amount) FROM support WHERE support.claim_hash=claim.claim_hash), 0
+                ) + claim.amount,
+                trending_amount = COALESCE(
+                    (SELECT SUM(amount) FROM support WHERE
+                        support.claim_hash=claim.claim_hash
+                    AND support.height > {height-self.TRENDING_BLOCKS}), 0
+                ),
+                activation_height = CASE
+                    WHEN activation_height > 0 THEN activation_height
+                    WHEN claim.claim_name NOT IN (SELECT claim_name FROM claimtrie) THEN {height}
+                    ELSE {height} + min(4032, cast(
+                        (
+                            {height} -
+                            (SELECT last_take_over_height FROM claimtrie
+                             WHERE claimtrie.claim_name=claim.claim_name)
+                        ) / 32 AS INT))
+                END
         """)
-        cur.execute("""
-            SELECT DISTINCT claim.claim_name, trie.claim_id
-            FROM claim LEFT JOIN claimtrie AS trie USING (claim_name)
+        self.execute("""
+            SELECT claim.claim_name, trie.claim_hash
+            FROM claim LEFT JOIN claimtrie AS trie
+            USING (claim_name) 
         """)
-        for claim_name, winning_id in cur.fetchall():
-            cur.execute("""
-                SELECT claim_id FROM claim
-                WHERE claim_name = ?
-                ORDER BY effective_amount DESC
-                LIMIT 1
-            """, (claim_name,))
-            new_winner = cur.fetchone()
-            if winning_id is None:
-                self.db.execute(*self._insert_sql(
-                    "claimtrie", {
-                        'claim_name': claim_name,
-                        'claim_id': sqlite3.Binary(new_winner[0]),
-                        'block': height
-                    }
-                ))
-            elif new_winner[0] != winning_id:
-                self.db.execute(*self._update_sql(
-                    "claimtrie", {
-                        'claim_id': sqlite3.Binary(new_winner[0]),
-                        'block': height
-                    }, 'claim_name = ?', (claim_name,)
-                ))
 
     def get_transactions(self, txids):
         cur = self.db.cursor()
-        cur.execute(*query("SELECT * FROM tx", **{'txid__in': txids}))
+        cur.execute(*query("SELECT * FROM tx", txid__in=txids))
         return cur.fetchall()
 
     def get_claims(self, cols, **constraints):
@@ -350,172 +345,51 @@ class SQLDB:
         txs = self.get_transactions(txids)
         return b64encode(to_page(claims, txs, constraints['offset'], total)).decode()
 
+    def advance_txs(self, height, all_txs):
+        sql, txs = self, set()
+        abandon_claim_hashes, stale_claim_metadata_txo_hashes = set(), set()
+        insert_claims, update_claims = set(), set()
+        delete_txo_hashes, insert_supports = set(), set()
+        for position, (etx, txid) in enumerate(all_txs):
+            tx = Transaction(etx.serialize(), height=height, position=position)
+            claim_abandon_map, delete_txo_hashes = sql.split_inputs_into_claims_and_other(tx.inputs)
+            stale_claim_metadata_txo_hashes.update(claim_abandon_map)
+            for output in tx.outputs:
+                if output.is_support:
+                    txs.add(tx)
+                    insert_supports.add(output)
+                elif output.script.is_claim_name:
+                    txs.add(tx)
+                    insert_claims.add(output)
+                elif output.script.is_update_claim:
+                    txs.add(tx)
+                    update_claims.add(output)
+                    # don't abandon update claims (removes supports & removes from claimtrie)
+                    for txo_hash, input_claim_hash in claim_abandon_map.items():
+                        if output.claim_hash == input_claim_hash:
+                            del claim_abandon_map[txo_hash]
+                            break
+            abandon_claim_hashes.update(claim_abandon_map.values())
+        sql.abandon_claims(abandon_claim_hashes)
+        sql.clear_claim_metadata(stale_claim_metadata_txo_hashes)
+        sql.delete_other_txos(delete_txo_hashes)
+        sql.insert_txs(txs)
+        sql.insert_claims(insert_claims)
+        sql.update_claims(update_claims)
+        sql.insert_supports(insert_supports)
+        sql.update_claimtrie(height)
+
 
 class LBRYDB(DB):
 
     def __init__(self, *args, **kwargs):
-        self.sqldb = SQLDB('/tmp/testxt/sqlite.db')
-        self.claim_cache = {}
-        self.claims_signed_by_cert_cache = {}
-        self.outpoint_to_claim_id_cache = {}
-        self.claims_db = self.signatures_db = self.outpoint_to_claim_id_db = self.claim_undo_db = None
-        # stores deletes not yet flushed to disk
-        self.pending_abandons = {}
         super().__init__(*args, **kwargs)
+        self.sql = SQLDB('claims.db')
 
     def close(self):
-        self.batched_flush_claims()
-        self.claims_db.close()
-        self.signatures_db.close()
-        self.outpoint_to_claim_id_db.close()
-        self.claim_undo_db.close()
-        self.utxo_db.close()
-        self.sqldb.close()
         super().close()
+        self.sql.close()
 
-    async def _open_dbs(self, for_sync, compacting):
-        self.sqldb.open()
-        await super()._open_dbs(for_sync=for_sync, compacting=compacting)
-        def log_reason(message, is_for_sync):
-            reason = 'sync' if is_for_sync else 'serving'
-            self.logger.info('{} for {}'.format(message, reason))
-
-        if self.claims_db:
-            if self.claims_db.for_sync == for_sync:
-                return
-            log_reason('closing claim DBs to re-open', for_sync)
-            self.claims_db.close()
-            self.signatures_db.close()
-            self.outpoint_to_claim_id_db.close()
-            self.claim_undo_db.close()
-        self.claims_db = self.db_class('claims', for_sync)
-        self.signatures_db = self.db_class('signatures', for_sync)
-        self.outpoint_to_claim_id_db = self.db_class('outpoint_claim_id', for_sync)
-        self.claim_undo_db = self.db_class('claim_undo', for_sync)
-        log_reason('opened claim DBs', self.claims_db.for_sync)
-
-    def flush_dbs(self, flush_data, flush_utxos, estimate_txs_remaining):
-        # flush claims together with utxos as they are parsed together
-        self.batched_flush_claims()
-        return super().flush_dbs(flush_data, flush_utxos, estimate_txs_remaining)
-
-    def batched_flush_claims(self):
-        with self.claims_db.write_batch() as claims_batch:
-            with self.signatures_db.write_batch() as signed_claims_batch:
-                with self.outpoint_to_claim_id_db.write_batch() as outpoint_batch:
-                    self.flush_claims(claims_batch, signed_claims_batch, outpoint_batch)
-
-    def flush_claims(self, batch, signed_claims_batch, outpoint_batch):
-        flush_start = time.time()
-        write_claim, write_cert = batch.put, signed_claims_batch.put
-        write_outpoint = outpoint_batch.put
-        delete_claim, delete_outpoint = batch.delete, outpoint_batch.delete
-        delete_cert = signed_claims_batch.delete
-        for claim_id, outpoints in self.pending_abandons.items():
-            claim = self.get_claim_info(claim_id)
-            if claim.cert_id:
-                self.remove_claim_from_certificate_claims(claim.cert_id, claim_id)
-            self.remove_certificate(claim_id)
-            self.claim_cache[claim_id] = None
-            for txid, tx_index in outpoints:
-                self.put_claim_id_for_outpoint(txid, tx_index, None)
-        for key, claim in self.claim_cache.items():
-            if claim:
-                write_claim(key, claim)
-            else:
-                delete_claim(key)
-        for cert_id, claims in self.claims_signed_by_cert_cache.items():
-            if not claims:
-                delete_cert(cert_id)
-            else:
-                write_cert(cert_id, msgpack.dumps(claims))
-        for key, claim_id in self.outpoint_to_claim_id_cache.items():
-            if claim_id:
-                write_outpoint(key, claim_id)
-            else:
-                delete_outpoint(key)
-        self.logger.info('flushed at height {:,d} with {:,d} claims, {:,d} outpoints '
-                         'and {:,d} certificates added while {:,d} were abandoned in {:.1f}s, committing...'
-                         .format(self.db_height,
-                                 len(self.claim_cache), len(self.outpoint_to_claim_id_cache),
-                                 len(self.claims_signed_by_cert_cache), len(self.pending_abandons),
-                                 time.time() - flush_start))
-        self.claim_cache = {}
-        self.claims_signed_by_cert_cache = {}
-        self.outpoint_to_claim_id_cache = {}
-        self.pending_abandons = {}
-
-    def assert_flushed(self, flush_data):
-        super().assert_flushed(flush_data)
-        assert not self.claim_cache
-        assert not self.claims_signed_by_cert_cache
-        assert not self.outpoint_to_claim_id_cache
-        assert not self.pending_abandons
-
-    def abandon_spent(self, tx_hash, tx_idx):
-        claim_id = self.get_claim_id_from_outpoint(tx_hash, tx_idx)
-        if claim_id:
-            self.logger.debug("[!] Abandon: {}".format(hash_to_hex_str(claim_id)))
-            self.pending_abandons.setdefault(claim_id, []).append((tx_hash, tx_idx,))
-            return claim_id
-
-    def put_claim_id_for_outpoint(self, tx_hash, tx_idx, claim_id):
-        self.logger.debug("[+] Adding outpoint: {}:{} for {}.".format(hash_to_hex_str(tx_hash), tx_idx,
-                                                                     hash_to_hex_str(claim_id) if claim_id else None))
-        self.outpoint_to_claim_id_cache[tx_hash + struct.pack('>I', tx_idx)] = claim_id
-
-    def remove_claim_id_for_outpoint(self, tx_hash, tx_idx):
-        self.logger.debug("[-] Remove outpoint: {}:{}.".format(hash_to_hex_str(tx_hash), tx_idx))
-        self.outpoint_to_claim_id_cache[tx_hash + struct.pack('>I', tx_idx)] = None
-
-    def get_claim_id_from_outpoint(self, tx_hash, tx_idx):
-        key = tx_hash + struct.pack('>I', tx_idx)
-        return self.outpoint_to_claim_id_cache.get(key) or self.outpoint_to_claim_id_db.get(key)
-
-    def get_signed_claim_ids_by_cert_id(self, cert_id):
-        if cert_id in self.claims_signed_by_cert_cache:
-            return self.claims_signed_by_cert_cache[cert_id]
-        db_claims = self.signatures_db.get(cert_id)
-        return msgpack.loads(db_claims, use_list=True) if db_claims else []
-
-    def put_claim_id_signed_by_cert_id(self, cert_id, claim_id):
-        msg = "[+] Adding signature: {} - {}".format(hash_to_hex_str(claim_id), hash_to_hex_str(cert_id))
-        self.logger.debug(msg)
-        certs = self.get_signed_claim_ids_by_cert_id(cert_id)
-        certs.append(claim_id)
-        self.claims_signed_by_cert_cache[cert_id] = certs
-
-    def remove_certificate(self, cert_id):
-        msg = "[-] Removing certificate: {}".format(hash_to_hex_str(cert_id))
-        self.logger.debug(msg)
-        self.claims_signed_by_cert_cache[cert_id] = []
-
-    def remove_claim_from_certificate_claims(self, cert_id, claim_id):
-        msg = "[-] Removing signature: {} - {}".format(hash_to_hex_str(claim_id), hash_to_hex_str(cert_id))
-        self.logger.debug(msg)
-        certs = self.get_signed_claim_ids_by_cert_id(cert_id)
-        if claim_id in certs:
-            certs.remove(claim_id)
-        self.claims_signed_by_cert_cache[cert_id] = certs
-
-    def get_claim_info(self, claim_id):
-        serialized = self.claim_cache.get(claim_id) or self.claims_db.get(claim_id)
-        return ClaimInfo.from_serialized(serialized) if serialized else None
-
-    def put_claim_info(self, claim_id, claim_info):
-        self.logger.debug("[+] Adding claim info for: {}".format(hash_to_hex_str(claim_id)))
-        self.claim_cache[claim_id] = claim_info.serialized
-
-    def get_update_input(self, claim_id, inputs):
-        claim_info = self.get_claim_info(claim_id)
-        if not claim_info:
-            return False
-        for input in inputs:
-            if (input.txo_ref.tx_ref.hash, input.txo_ref.position) == (claim_info.txid, claim_info.nout):
-                return input
-        return False
-
-    def write_undo(self, pending_undo):
-        with self.claim_undo_db.write_batch() as writer:
-            for height, undo_info in pending_undo:
-                writer.put(struct.pack(">I", height), msgpack.dumps(undo_info))
+    async def _open_dbs(self, *args):
+        await super()._open_dbs(*args)
+        self.sql.open()

@@ -9,7 +9,6 @@ from lbrynet.stream.downloader import StreamDownloader
 from lbrynet.stream.descriptor import StreamDescriptor
 from lbrynet.stream.reflector.client import StreamReflectorClient
 from lbrynet.extras.daemon.storage import StoredStreamClaim
-from lbrynet.blob.blob_file import BlobFile
 if typing.TYPE_CHECKING:
     from lbrynet.conf import Config
     from lbrynet.schema.claim import Claim
@@ -130,7 +129,7 @@ class ManagedStream:
         return None if not self.stream_claim_info else self.stream_claim_info.claim_name
 
     @property
-    def metadata(self) ->typing.Optional[typing.Dict]:
+    def metadata(self) -> typing.Optional[typing.Dict]:
         return None if not self.stream_claim_info else self.stream_claim_info.claim.stream.to_dict()
 
     @property

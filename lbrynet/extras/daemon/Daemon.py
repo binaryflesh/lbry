@@ -2446,7 +2446,7 @@ class Daemon(metaclass=JSONRPCServerType):
                 new_txo.script.generate()
                 stream_hash = file_stream.stream_hash
             else:
-                stream_hash = await self.storage.get_stream_hash_for_sd_hash(old_txo.claim.stream.hash)
+                stream_hash = await self.storage.get_stream_hash_for_sd_hash(old_txo.claim.stream.sd_hash)
             if channel:
                 new_txo.sign(channel)
             await tx.sign([account])
